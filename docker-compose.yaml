@@ -1,0 +1,201 @@
+version: "3.9"
+
+services:
+# 1. Primary vLLM Instance (Arc B70 - GPU 0)
+  vllm-b70:
+    image: intel/vllm:latest
+    container_name: vllm-b70
+    restart: unless-stopped
+    privileged: true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - ZE_AFFINITY_MASK=0
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - CCL_ATL_TRANSPORT=ofi
+      - FI_PROVIDER=tcp
+      - CCL_ZE_IPC_EXCHANGE=sockets
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path
+      - /dev/dri:/dev/dri
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    shm_size: 10g
+    ipc: host
+    ports:
+      - "8000:8000"
+    command: >
+      vllm serve Intel/Qwen3.6-27B-int4-AutoRound
+      --port 8000
+      --tensor-parallel-size 1
+      --max-model-len 120000
+      --gpu-memory-utilization 0.95
+      --max-num-seqs 12
+      --served-model-name qwen-b70
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+    networks:
+      - agent-net
+
+  # 2. Secondary vLLM Instance (Arc Pro B60 - GPU 1)
+  vllm-b60:
+    image: intel/vllm:latest
+    container_name: vllm-b60
+    restart: unless-stopped
+    privileged: true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - ZE_AFFINITY_MASK=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - CCL_ATL_TRANSPORT=ofi
+      - FI_PROVIDER=tcp
+      - CCL_ZE_IPC_EXCHANGE=sockets
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path
+      - /dev/dri:/dev/dri
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    shm_size: 10g
+    ipc: host
+    ports:
+      - "8001:8000"
+    command: >
+      vllm serve Intel/Qwen3.6-27B-int4-AutoRound
+      --port 8000
+      --tensor-parallel-size 1
+      --max-model-len 32768
+      --gpu-memory-utilization 0.99
+      --max-num-seqs 8
+      --served-model-name qwen-b60
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+    networks:
+      - agent-net
+
+  # 3. Prime Agent
+  prime-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: prime-agent
+    restart: unless-stopped
+    networks:
+      - agent-net
+    depends_on:
+      - vllm-b70
+      - vllm-b60
+    volumes:
+      - ./workspace:/app
+      - ${HOME}/.prime:/root/.prime
+      - prime-kernel:/opt/prime-kernel
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    environment:
+      - TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
+    command: >
+      bash -c '
+        # 1. Workspace repository check
+        if [ ! -f "/app/package.json" ]; then
+          echo "Cloning Prime Agent repository..."
+          git clone https://github.com/PrimeIntellect-ai/prime-agent.git .
+        fi
+
+        # 2. Kernel venv: build only on cold start (first run with empty named volume)
+        if [ ! -f "/opt/prime-kernel/bin/python" ]; then
+          echo "First run: building Python kernel venv..."
+          uv venv --python 3.11 /opt/prime-kernel
+          uv pip install --python /opt/prime-kernel/bin/python \
+              ipykernel requests httpx pyyaml tomli python-dotenv pandas numpy scipy beautifulsoup4 lxml pydantic fpdf2
+        fi
+        export PRIME_AGENT_KERNEL_PYTHON=/opt/prime-kernel/bin/python
+
+        # 3. Install core prime-agent-runtime FIRST, then remaining skills (idempotent)
+        echo "Locating and installing core prime-agent-runtime..."
+        RUNTIME_DIR=$$(find /app -name "pyproject.toml" 2>/dev/null | xargs grep -l "prime-agent-runtime" 2>/dev/null | head -n 1 | xargs dirname 2>/dev/null)
+        if [ -n "$$RUNTIME_DIR" ] && [ -d "$$RUNTIME_DIR" ]; then
+          echo "Installing core runtime from $$RUNTIME_DIR..."
+          uv pip install --python /opt/prime-kernel/bin/python -e "$$RUNTIME_DIR"
+        fi
+
+        echo "Installing remaining local Prime Agent packages..."
+        find /app/packages -name "pyproject.toml" -o -name "setup.py" 2>/dev/null | while read -r pkg; do
+          pkg_dir=$$(dirname "$$pkg")
+          if [ "$$pkg_dir" != "$$RUNTIME_DIR" ]; then
+            echo "Installing local package from $$pkg_dir..."
+            uv pip install --python /opt/prime-kernel/bin/python -e "$$pkg_dir" || true
+          fi
+        done
+
+        # 4. Configurations: use cp -n to avoid overwriting existing config files
+        mkdir -p ~/.prime/agent ~/.prime/gmail-mcp
+        ln -sfn ~/.prime/gmail-mcp /root/.gmail-mcp
+        cp -n ~/.prime/gcp-oauth.keys.json ~/.prime/gmail-mcp/gcp-oauth.keys.json 2>/dev/null || true
+
+        if [ -n "$$CEREBRAS_API_KEY" ] && [ ! -f ~/.prime/agent/auth.json ]; then
+          echo "{"cerebras":{"type":"api_key","key":"$$CEREBRAS_API_KEY"}}" > ~/.prime/agent/auth.json
+        fi
+
+        if [ ! -f ~/.prime/agent/models.json ]; then
+          echo "Writing default models.json (no existing file)..."
+          echo "{"providers":{"vllm-b70":{"baseUrl":"http://vllm-b70:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b70","contextWindow":110000,"maxTokens":4096}]},"vllm-b60":{"baseUrl":"http://vllm-b60:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b60","contextWindow":27000,"maxTokens":4096}]}}}" > ~/.prime/agent/models.json
+        fi
+
+        if [ ! -f ~/.prime/agent/mcp.json ]; then
+          echo "Writing default mcp.json (no existing file)..."
+          echo "{"mcpServers":{"gmail":{"command":"node","args":["/root/.prime/Gmail-MCP-Server/dist/index.js"]}}}" > ~/.prime/agent/mcp.json
+        fi
+
+        ln -sfn ~/.prime/agent/mcp.json /app/.mcp.json
+        ln -sfn ~/.prime/agent/mcp.json /root/.mcp.json
+
+        # 5. Launch Prime Agent with B70 orchestrator default
+        npm install
+        echo "Starting Prime Agent..."
+        ./prime-agent.sh --provider vllm-b70 --model qwen-b70
+      '
+
+  # 4. Tailscale Exit Node & Remote Host Access
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    restart: unless-stopped
+    networks:
+      - agent-net
+    privileged: true
+    pid: host
+    cap_add:
+      - net_admin
+      - net_raw
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=FALSE
+      - TS_EXTRA_ARGS=--advertise-exit-node --ssh
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c '
+        apk add --no-cache util-linux
+        echo "exec nsenter --target 1 --mount --uts --ipc --pid -- su - dom" > /root/.profile
+        echo "exec nsenter --target 1 --mount --uts --ipc --pid -- su - dom" > /etc/profile
+        /usr/local/bin/containerboot
+      '
+
+volumes:
+  tailscale-state:
+  prime-kernel:
+
+networks:
+  agent-net:
+    driver: bridge

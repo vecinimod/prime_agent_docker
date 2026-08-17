@@ -1,0 +1,21 @@
+# Secrets and Credentials
+.env
+client_secret_*.json
+*.pem
+*.key
+
+# Agent Runtime and State
+workspace/
+
+# Backups and Editor Files
+*~
+*.bak
+*.swp
+old_config/
+
+# Standard Python / Node Ignore
+__pycache__/
+*.py[cod]
+*$py.class
+node_modules/
+.venv/
