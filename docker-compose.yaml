@@ -1,9 +1,7 @@
-version: "3.9"
-
 services:
 # 1. Primary vLLM Instance (Arc B70 - GPU 0)
   vllm-b70:
-    image: intel/vllm:latest
+    image: vllm/vllm-openai-xpu@sha256:f01e24f6c7ff01f1e0662234255a1372297d1dbd89d003cf13c8fad3eab1ba4f
     container_name: vllm-b70
     restart: unless-stopped
     privileged: true
@@ -11,7 +9,12 @@ services:
       - 8.8.8.8
       - 1.1.1.1
     environment:
+      - VLLM_TARGET_DEVICE=xpu
+      - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
       - ZE_AFFINITY_MASK=0
+      - B70_MTP_BF16_DRAFT=1
+      - VLLM_XPU_ENABLE_XPU_GRAPH=1
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
       - CCL_ATL_TRANSPORT=ofi
@@ -21,23 +24,36 @@ services:
       - /dev/dri/by-path:/dev/dri/by-path
       - /dev/dri:/dev/dri
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ./patches/patch_mtp_nightly.py:/patch_mtp.py:ro
+      - ./patches/patch_mtp_boundary.py:/patch_boundary.py:ro
     shm_size: 10g
     ipc: host
     ports:
       - "8000:8000"
+    entrypoint: []
     command: >
-      vllm serve Intel/Qwen3.6-27B-int4-AutoRound
+      bash -lc "
+      python /patch_mtp.py &&
+      python /patch_boundary.py &&
+      exec vllm serve SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16
       --port 8000
       --tensor-parallel-size 1
-      --max-model-len 120000
-      --gpu-memory-utilization 0.95
-      --max-num-seqs 12
+      --max-model-len 131072
+      --gpu-memory-utilization 0.88
+      --max-num-seqs 64
+      --max-num-batched-tokens 8192
+      --no-enable-prefix-caching
+      --language-model-only
+      --quantization gptq
+      --dtype float16
       --served-model-name qwen-b70
       --enable-auto-tool-choice
       --tool-call-parser qwen3_xml
+      --kv-cache-dtype fp8
+      --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":4}'
+      "
     networks:
       - agent-net
-
   # 2. Secondary vLLM Instance (Arc Pro B60 - GPU 1)
   vllm-b60:
     image: intel/vllm:latest
