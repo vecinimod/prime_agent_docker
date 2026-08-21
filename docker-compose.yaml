@@ -1,5 +1,5 @@
 services:
-# 1. Primary vLLM Instance (Arc B70 - GPU 0)
+  # 1. Primary vLLM Instance (Arc B70 - GPU 0)
   vllm-b70:
     image: vllm/vllm-openai-xpu@sha256:f01e24f6c7ff01f1e0662234255a1372297d1dbd89d003cf13c8fad3eab1ba4f
     container_name: vllm-b70
@@ -49,14 +49,16 @@ services:
       --served-model-name qwen-b70
       --enable-auto-tool-choice
       --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
       --kv-cache-dtype fp8
       --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'
       "
     networks:
       - agent-net
-  # 2. Secondary vLLM Instance (Arc Pro B60 - GPU 1)
+
+# 2. Secondary vLLM Instance (Arc Pro B60 - GPU 1)
   vllm-b60:
-    image: intel/vllm:latest
+    image: intel/vllm:latest 
     container_name: vllm-b60
     restart: unless-stopped
     privileged: true
@@ -70,11 +72,15 @@ services:
       - CCL_ATL_TRANSPORT=ofi
       - FI_PROVIDER=tcp
       - CCL_ZE_IPC_EXCHANGE=sockets
+      # XPU & SYCL Optimizations
+      - VLLM_XPU_ENABLE_XPU_GRAPH=1
+      - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMAND_LIST=1
+      - SYCL_CACHE_PERSISTENT=1
     volumes:
       - /dev/dri/by-path:/dev/dri/by-path
       - /dev/dri:/dev/dri
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-    shm_size: 10g
+    shm_size: 32g
     ipc: host
     ports:
       - "8001:8000"
@@ -82,15 +88,15 @@ services:
       vllm serve Intel/Qwen3.6-27B-int4-AutoRound
       --port 8000
       --tensor-parallel-size 1
-      --max-model-len 32768
-      --gpu-memory-utilization 0.99
-      --max-num-seqs 1
+      --max-model-len 28672
+      --gpu-memory-utilization 0.90
+      --max-num-seqs 8
       --served-model-name qwen-b60
       --enable-auto-tool-choice
       --tool-call-parser qwen3_xml
+      --enable-prefix-caching
     networks:
       - agent-net
-
   # 3. Prime Agent
   prime-agent:
     build:
@@ -158,8 +164,8 @@ services:
         fi
 
         if [ ! -f ~/.prime/agent/models.json ]; then
-          echo "Writing default models.json (no existing file)..."
-          echo "{"providers":{"vllm-b70":{"baseUrl":"http://vllm-b70:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b70","contextWindow":131000,"maxTokens":20000,"defaultChatTemplateKwargs":{"reasoning_effort":"medium"}}]},"vllm-b60":{"baseUrl":"http://vllm-b60:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b60","contextWindow":32000,"maxTokens":5000}]}}}" > ~/.prime/agent/models.json
+          echo "Writing default models.json with thinking/reasoning support..."
+          echo '{"providers":{"vllm-b70":{"baseUrl":"http://vllm-b70:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b70","contextWindow":131000,"maxTokens":40000,"reasoning":true,"thinkingLevelMap":{"medium":"medium","low":"low","high":"high","xhigh":"xhigh"},"defaultChatTemplateKwargs":{"reasoning_effort":"medium","enable_thinking":true}}]},"vllm-b60":{"baseUrl":"http://vllm-b60:8000/v1","api":"openai-completions","apiKey":"none","models":[{"id":"qwen-b60","contextWindow":32000,"maxTokens":5000}]}}}' > ~/.prime/agent/models.json
         fi
 
         if [ ! -f ~/.prime/agent/mcp.json ]; then
